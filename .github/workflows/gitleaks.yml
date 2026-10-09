@@ -1,0 +1,60 @@
+name: Gitleaks
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  scan:
+    name: Secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # gitleaks BINARIO (open-source, gratis) — evita a licenca que a Action exige em ORG.
+      # Ver DataBoar/maestro#10 e docs/ops/_BUS_gitleaks-binary-org-wide-sweep.md (data-boar).
+      # SHA256 is pinned in this file (issue #6): do not verify against the
+      # release checksums.txt from the same GitHub release — that is self-referential.
+      - name: gitleaks (binary, no org-license)
+        run: |
+          VER="8.30.1"
+          BASE="https://github.com/gitleaks/gitleaks/releases/download/v${VER}"
+          TARBALL="gitleaks_${VER}_linux_x64.tar.gz"
+          SHA256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+          CONFIG_URL="https://raw.githubusercontent.com/gitleaks/gitleaks/83d9cd6/config/gitleaks.toml"
+          CONFIG_SHA256="e163e53b9e7e8a8511e77271e2b323ed057759542a6d988258afe3a1fa329caf"
+          CONFIG_SOURCE="${RUNNER_TEMP}/gitleaks-upstream.toml"
+          STRICT_CONFIG="${RUNNER_TEMP}/gitleaks-strict.toml"
+          curl -sSfL "${BASE}/${TARBALL}" -o "${TARBALL}"
+          echo "${SHA256}  ${TARBALL}" | sha256sum -c -
+          tar -xzf "${TARBALL}" gitleaks
+          # Use all upstream rules from an immutable, checksum-verified source,
+          # but omit its global path allowlist: this required merge gate must
+          # also inspect paths such as SVGs, lockfiles, and node_modules.
+          curl -sSfL "${CONFIG_URL}" -o "${CONFIG_SOURCE}"
+          echo "${CONFIG_SHA256}  ${CONFIG_SOURCE}" | sha256sum -c -
+          {
+            printf 'title = "gitleaks strict merge gate"\n\n'
+            sed -n '/^\[\[rules\]\]/,$p' "${CONFIG_SOURCE}"
+          } > "${STRICT_CONFIG}"
+          # Vulnerability Scanner (2026-08-24): gitleaks auto-loads
+          # (target path)/.gitleaks.toml when present and honors inline
+          # `# gitleaks:allow` comments unless told not to -- a PR could ship
+          # its own allowlist (or an allow comment) and green this required
+          # check over a real secret. Reproduced locally: a `.gitleaks.toml`
+          # with `paths = ['.*']` flips "leaks found: 1" to "no leaks found"
+          # for the SAME commit. Strip any repo-provided config/ignore file
+          # from THIS checkout before scanning, and refuse inline allow
+          # comments, so the merge gate always runs gitleaks' own default rules.
+          rm -f .gitleaks.toml .gitleaksignore
+          ./gitleaks git . --config "${STRICT_CONFIG}" --max-archive-depth 2 --no-banner --redact --exit-code 1 --ignore-gitleaks-allow
